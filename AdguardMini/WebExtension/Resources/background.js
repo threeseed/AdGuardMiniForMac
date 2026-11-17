@@ -99,14 +99,15 @@ const extraStatusManager = (function () {
     // https://developer.chrome.com/docs/extensions/reference/api/alarms?hl=ru
     const EXTRA_STATUS_UPDATE_INTERVAL_MINUTES = 0.5;
 
-    // Update extra status additionally every 5 seconds
-    // This is needed to avoid long waiting for the alarm update
-    const EXTRA_STATUS_UPDATE_INTERVAL_SECONDS = 5;
+    // A status older than this is refreshed on demand instead of by a fixed poll.
+    const EXTRA_STATUS_MAX_AGE_MS = 5000;
 
     let _canUseExtra = false;
     let _gotResponseFromBackend = false;
     let _verbose = false;
     let _promise = null;
+    let _lastRequestTime = 0;
+    let _inFlight = null;
 
     /**
      * Request extra status from the main app
@@ -133,17 +134,30 @@ const extraStatusManager = (function () {
         periodInMinutes: EXTRA_STATUS_UPDATE_INTERVAL_MINUTES
     });
 
+    /**
+     * Starts a status request unless one is already in flight
+     *
+     * @returns {Promise<void>}
+     */
+    function refresh() {
+        if (_inFlight) {
+            return _inFlight;
+        }
+        _lastRequestTime = Date.now();
+        _inFlight = requestExtraStatus().finally(() => {
+            _inFlight = null;
+        });
+        _promise = _inFlight;
+        return _inFlight;
+    }
+
     browser.alarms.onAlarm.addListener((alarm) => {
         if (alarm.name === ALARM_NAME) {
-            _promise = requestExtraStatus();
+            refresh();
         }
     });
 
-    setInterval(() => {
-        _promise = requestExtraStatus();
-    }, EXTRA_STATUS_UPDATE_INTERVAL_SECONDS * 1000);
-
-    _promise = requestExtraStatus();
+    refresh();
 
     return Object.freeze({
         /**
@@ -152,6 +166,9 @@ const extraStatusManager = (function () {
          * @returns {Promise<boolean>}
          */
         async canUseExtra() {
+            if (Date.now() - _lastRequestTime > EXTRA_STATUS_MAX_AGE_MS) {
+                refresh();
+            }
             return _promise.then(() => _canUseExtra && _gotResponseFromBackend);
         },
 
@@ -224,7 +241,6 @@ const rulesCache = (function () {
 
         // Consider this is a hot record, and update timestamp
         entry.timestamp = Date.now();
-        cacheMap.set(url, entry);
 
         return entry.payload;
     }
@@ -286,26 +302,61 @@ async function pipeExtraScriptToTab(tabId) {
 }
 
 /**
+ * In-flight advanced blocking requests keyed by URL, so concurrent callers share one native round trip
+ * @type {Map<string, Promise<any|null>>}
+ */
+const pendingAdvancedBlockingRequests = new Map();
+
+/**
+ * Checks that the URL can carry advanced blocking rules
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isHttpUrl(url) {
+    return typeof url === "string" && (url.startsWith("http:") || url.startsWith("https:"));
+}
+
+/**
+ * Requests advanced blocking data for the URL from the main app and caches it
+ *
+ * @param {string} url
+ * @returns {Promise<any|null>} null when there is no data
+ */
+function fetchAdvancedBlockingData(url) {
+    const pending = pendingAdvancedBlockingRequests.get(url);
+    if (pending) {
+        return pending;
+    }
+    const request = requestMainApp(MessageType.advancedBlockingData, { url })
+        .then((result) => {
+            if (Array.isArray(result) && result.length > 0) {
+                rulesCache.set(url, result[0]);
+                return result[0];
+            }
+            return null;
+        })
+        .finally(() => {
+            pendingAdvancedBlockingRequests.delete(url);
+        });
+    pendingAdvancedBlockingRequests.set(url, request);
+    return request;
+}
+
+/**
  * Pipes advanced blocking data from the main app to the tab
  * 
  * @param {number} tabId
  * @param {string} url Requested URL, not tab URL
  */
 async function pipeAdvancedBlockingDataToTab(tabId, url) {
+    if (!isHttpUrl(url)) {
+        return;
+    }
     try {
-        let advancedBlockingData = rulesCache.get(url);
+        const advancedBlockingData = rulesCache.get(url) ?? await fetchAdvancedBlockingData(url);
         if (!advancedBlockingData) {
-            const result = await requestMainApp(MessageType.advancedBlockingData, {
-                url
-            });
-
-            if (Array.isArray(result) && result.length > 0) {
-                advancedBlockingData = result[0];
-                rulesCache.set(url, advancedBlockingData);
-            } else {
-                // No advanced blocking data
-                return;
-            }
+            return;
         }
 
         await requestTab(tabId, {
@@ -318,17 +369,11 @@ async function pipeAdvancedBlockingDataToTab(tabId, url) {
 }
 
 /**
- * Tabs changes subscriber
+ * Tabs changes subscriber. Extra is not pushed from here: every frame's injector requests it itself.
  * 
  * @param {Tab} tab
  */
 function tabInfoUpdateListener(tab) {
-    // Trying to precache extra script onCreate
-    if (tab.status === "loading") {
-        pipeExtraScriptToTab(tab.id);
-    }
-
-    console.info(`tabInfoUpdateListener called with tab status: ${tab.status}`);
     if (!tab.url) {
         return;
     }
@@ -337,8 +382,11 @@ function tabInfoUpdateListener(tab) {
 }
 
 browser.tabs.onCreated.addListener(tabInfoUpdateListener);
-browser.tabs.onUpdated.addListener((_, _1, tab) => {
-    tabInfoUpdateListener(tab);
+browser.tabs.onUpdated.addListener((_, changeInfo, tab) => {
+    // Title, favicon and "complete" updates do not change the rules a tab needs.
+    if (changeInfo.url || changeInfo.status === "loading") {
+        tabInfoUpdateListener(tab);
+    }
 });
 
 // Prefetch the data when the extension or page is loaded
