@@ -41,7 +41,7 @@ final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, @un
     }
 
     func beginRequest(with context: NSExtensionContext) {
-        LogInfo("SafariWebExtension received a request: \(context)")
+        LogDebug("SafariWebExtension received a request")
         guard let item = context.inputItems.first as? NSExtensionItem,
               let userInfo = item.userInfo as? [String: Any],
               let message = userInfo[SFExtensionMessageKey] as? [String: Any],
